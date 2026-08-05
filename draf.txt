@@ -1,0 +1,119 @@
+Chào mừng mọi người đã đến với buổi seminar?? ngày hôm nay do team FE tổ chức ạ. Buổi hôm nay em xin phép thay mặt team sẽ trình bày, giới thiệu đến với mọi người một chủ đề là Token.
+Hiện nay thì nhân viên trong công ty mới được sử dụng external AI cho việc coding assistant, hôm trước em mới thử làm vài đường prompt nhẹ bằng Claude code, xong úi giồi ôi, mất tong 5 đô.
+Vâng với ... đó thì việc tiết kiệm token lại càng là 1 chuyện vô cùng ... cần được áp dụng vào trong workflow để có thể sử dụng, vắt kiệt các external AI agent vào các việc khác nhau.
+
+Đầu tiên chúng ta sẽ đi vào một chút về lý thuyết đi. Mọi người hay nói token này, token kia, nhưng mọi người có biết token nó thực sự là gì, và nó được tạo ra như thế nào không ạ? 
+AI ko đọc văn bản như chúng ta đọc sách, chúng xử lý luồng dữ liệu thông qua các mảnh ghép được gọi là token, hình thành từ thuật toán Byte Pair Encoding (BPE).
+
+Thuật toán BPE khởi đầu bằng việc coi mỗi byte (giá trị từ 0-255) là một token riêng biệt, sau đó đếm tần suất xuất hiện của các cặp byte liền kề trong một tập dữ liệu huấn luyện khổng lồ. Cặp byte xuất hiện nhiều nhất sẽ được hợp nhất thành một token mới. Quá trình này lặp lại liên tục cho đến khi đạt được quy mô từ vựng (vocabulary size) mục tiêu.
+
+Mô tả 1 ví dụ từ chữ thành token: Data Platform
+Lần 1: ...
+Tần suất: ...
+=> Ghép token,... => 
+Lần 2: ...
+
+
+Trong bối cảnh lập trình phần mềm, cơ chế này tạo ra những cạm bẫy tiềm ẩn về chi phí. Mã nguồn phụ thuộc rất lớn vào cấu trúc không gian, đặc biệt là khoảng trắng (whitespace) và thụt lề (indentation).
+Nhiều tokenizer truyền thống xử lý các chuỗi khoảng trắng hoặc tab thành các token riêng rẽ. Ví dụ, một cấu trúc dữ liệu JSON được định dạng đẹp mắt (pretty-printed) với các khoảng thụt lề bốn dấu cách có thể tiêu tốn 19 token, trong khi cùng cấu trúc đó nếu được nén lại (minified) bằng cách loại bỏ khoảng trắng thừa chỉ tiêu tốn 11 token. Việc gửi các cấu trúc JSON, tệp log, hoặc cấu hình chưa được nén cho API có thể làm tăng dấu chân token đầu vào lên tới 40%.
+
+Chúng ta đến với quá trình tiếp theo, sau khi Agent nhận vào token được thì chúng làm gì? 
+Có 2 giai đoạn xử lý là prefill và decode
+- Prefill, hệ thống tính toán cho toàn bộ chuỗi token đầu vào cùng một lúc. Giai đoạn này tiêu thụ nhiều sức mạnh tính toán của GPU. Kết quả của giai đoạn Prefill là một cấu trúc dữ liệu khổng lồ được gọi là KV Cache (Key-Value Cache), nơi lưu trữ trạng thái ngữ cảnh nội bộ để chuẩn bị sinh văn bản. 
+
+KV cache này chính là cache prompt feature được các bên dịch vụ AI Agent hỗ trợ như Claude, Gemini,...
+
+- Giai đoạn decode: Giai đoạn này chính là lúc mà Agent sinh ra các token, ra response cho người dùng.
+Decode diễn ra một cách tuần tự (autoregressive). Để sinh ra token thứ N+1, mô hình phải truy xuất lại toàn bộ KV Cache chứa N token trước đó từ bộ nhớ của GPU. Do đó, giai đoạn này bị giới hạn nghiêm trọng bởi băng thông bộ nhớ (memory-bandwidth-bound) thay vì năng lực tính toán. GPU lại là tài nguyên tốn kém nhất trên hành tinh
+
+--> Vậy nên chúng ta có sự chênh lệch giá giữa input token và output token.
+
+
+Các lý do tiêu tốn token chung
+....
+
+Các lý do tiêu tốn token trong quá trình dev:
+
+Giai đoạn solution và design
+ở giai đoạn này thì thường yêu cầu AI phác thảo kiến trúc hệ thống hoặc luồng dữ liệu.
+
+Lỗi phổ biến nhất gây lãng phí token ở bước này là yêu cầu mô hình sinh ra hoặc đọc các biểu đồ được vẽ bằng ASCII (ASCII art). Các biểu đồ ASCII chứa vô số các ký tự đường ống (|), dấu gạch ngang (-), và dấu cộng (+), gây nhiễu loạn nghiêm trọng đối với bộ phân tích BPE. Một biểu đồ ASCII đơn giản có thể tiêu thụ 55 token và rất dễ bị mô hình hiểu sai lệch do sự đứt gãy không gian trong quá trình token hóa.
+Giải pháp thay thế ưu việt nhất cho thiết kế kiến trúc là sử dụng Mermaid.js
+
+ Đây là một ngôn ngữ mô tả đồ họa dưới dạng văn bản (text-based diagramming) được các LLM hiện đại thấu hiểu sâu sắc nhờ sự xuất hiện dày đặc của nó trong các tài liệu trên GitHub
+
+
+Hơn thế nữa, các nghiên cứu gần đây về "Biểu đồ Chỉ dẫn dựa trên Mermaid" (Mermaid-based Instruction Graphs) đã chứng minh rằng cấu trúc Mermaid có thể định hướng trực tiếp quá trình suy luận của LLM. Bằng cách mã hóa một luồng suy luận thành các nút (nodes) nguyên tử và kiểm soát các điều kiện rẽ nhánh bằng các cạnh (edges), lập trình viên ép buộc LLM phải tuân thủ các quy trình kiểm duyệt nghiêm ngặt, từ đó đạt được sự gia tăng mạnh mẽ về cả độ chính xác lẫn hiệu suất trên mỗi đô la chi phí???? (Cần đọc thêm về proof)
+
+
+Giai đoạn triển khai mã nguồn
+các Agent (như Claude Code hoặc Aider) thường được trang bị khả năng thực thi các công cụ dòng lệnh (CLI) và tự động đọc các tệp. Lượng token bị lãng phí ở đây chủ yếu đến từ hai nguồn:
+- Thông tin từ các tools mà AI có (Vấn đề này cũng được đề cập ở buổi seminar Ra kết quả tương tự nhưng với ít token hơn) Khi Agent sử dụng giao thức Model Context Protocol (MCP) để kết nối với các công cụ bên ngoài, toàn bộ cấu trúc định nghĩa công cụ (JSON schema) sẽ được đính kèm vào mỗi lượt phản hồi của Prompt
+
+- Dữ liệu rác từ dòng lệnh: Khi Agent thực thi các lệnh bash như npm test, git status, hoặc trình biên dịch, toàn bộ luồng dữ liệu đầu ra (stdout) được đẩy thẳng vào cửa sổ ngữ cảnh. Nếu một bài kiểm thử sinh ra 5,000 token log, trong khi đó thì mình, hoặc AI chỉ quan tâm đến 1 phần nhỏ dữ liệu trong đầu ra câu lệnh thôi.
+
+Giai đoạn code review.
+
+Trong quá trình đánh giá sự thay đổi, lập trình viên thường dùng lệnh git diff tiêu chuẩn để cấp dữ liệu cho LLM. Tuy nhiên, git diff vốn được thiết kế cho mắt người nhìn trên màn hình terminal, bao gồm rất nhiều dòng ngữ cảnh không đổi (context lines) và các tiêu đề khối (hunk headers) vô nghĩa đối với máy móc.
+
+Từ các lỗi trên thì bọn em có chọn ra 3 tools để giúp giảm thiểu lượng token sử dụng.
+
+Đầu tiên là CodeGraph
+Tại sao lại chọn?  ...
+Giới thiệu về code graph, ... cơ chế, ... usecase cơ bản,...
+
+
+
+Tiếp theo là rtk
+Tại sao lại chọn? Để giảm token lãng phí ở quá trình implement
+Giới thiêu về rtk, mục đích, cơ chế, use case cơ bản,...
+
+
+Hình ảnh dùng command bình thường và khi dùng command với rtk
+hình ảnh gì đó (Hình ảnh code gain?)
+
+Tiếp theo là Caveman
+Tại sao? Giảm token đầu ra
+Cũng tương tự như 2 tools trên
+
+
+
+Các tips tricks, usecase khi sử dụng 3 tools.
+Tham khảo
+```
+Sự kết hợp giữa RTK, Caveman, và CodeGraph không phải là ngẫu nhiên; chúng tạo ra một "Tam giác vàng" hoàn hảo bao phủ toàn bộ vòng đời của token trong một quy trình AI Agent:CodeGraph: Giải quyết Input tĩnh (Bức tranh toàn cảnh của dự án).RTK: Giải quyết Input động (Tiếng ồn từ terminal và logs).Caveman: Giải quyết Output (Sự dài dòng vô ích của LLM).Dưới đây là các usecase, chiến lược kết hợp (tips/tricks) và phương pháp đo lường để bạn có thể vắt kiệt từng xu giá trị từ Claude, Gemini và Cline.I. Các Usecases & Khi Nào Nên Sử DụngĐể bộ 3 này phát huy tối đa sức mạnh, bạn cần phân bổ chúng vào đúng giai đoạn của luồng công việc (Workflow).1. Giai đoạn Phác thảo & Lên kế hoạch (Planner Phase)Công cụ chủ đạo: CodeGraphKhi nào sử dụng: Khi mới mở Cline/Claude Code đầu phiên làm việc, hoặc khi cần Agent phân tích kiến trúc để thêm tính năng mới.Cách hoạt động: Thay vì "nhồi nhét" toàn bộ thư mục (có thể ngốn hàng trăm ngàn token), CodeGraph sử dụng thuật toán Tree-sitter và PageRank để nén kho mã nguồn thành một bản đồ đồ thị chỉ khoảng 1,000 đến 2,000 token. Mô hình sẽ nhìn thấy chữ ký hàm (function signatures) và các liên kết module thay vì phải đọc chi tiết từng dòng code.  2. Giai đoạn Thực thi & Sửa lỗi (Implementer Phase / Debugging)Công cụ chủ đạo: RTK + Caveman (Chế độ Ultra)Khi nào sử dụng: Khi Agent rơi vào vòng lặp "Sửa code $\rightarrow$ Chạy Test $\rightarrow$ Đọc Log $\rightarrow$ Sửa lại" (Vòng lặp Ralph Wiggum).  Cách hoạt động:RTK đứng chặn ở giữa Agent và Terminal. Khi Agent gọi các lệnh như npm test hay pytest, RTK sẽ tự động tước bỏ các biểu đồ ASCII, dòng trắng, gom nhóm lỗi và khử trùng lặp (ví dụ: gộp các log in ra liên tục thành [x15] Memory Warning), giúp giảm 60% đến 90% lượng token đầu vào.  Caveman ép Agent (Claude/Gemini) phải phản hồi bằng các câu cụt lủn, bỏ hết các từ nối, lời chào hỏi thừa thãi, nhưng vẫn giữ nguyên 100% tính chính xác của mã nguồn. Nó giúp giảm trung bình 65% token đầu ra (loại token đắt đỏ nhất) và giảm thời gian chờ phản hồi.II. Tips & Tricks Tối Ưu Kết Hợp (Synergy)Để 3 công cụ này cộng hưởng thay vì dẫm chân lên nhau, bạn có thể áp dụng các thủ thuật sau:Nén ngữ cảnh bằng /caveman-compress: Caveman có một lệnh rất hay là /caveman-compress. Bạn hãy dùng CodeGraph để tạo ra tệp tổng quan dự án, sau đó dùng lệnh này của Caveman để ép tệp đó thành văn phong "người tối cổ". Điều này giúp tiết kiệm thêm ~46% token đầu vào trước khi lưu thành file CLAUDE.md tĩnh.Bảo vệ Prompt Caching (Khớp Tiền Tố Chính Xác): Để tận dụng bộ nhớ đệm (Cache) giúp giảm 90% chi phí hóa đơn, bạn phải sắp xếp cấu trúc Prompt cực kỳ nghiêm ngặt:  Lớp tĩnh (Trên cùng): Đặt Repo Map của CodeGraph và các system prompt của Caveman ở đây.  Lớp động (Dưới cùng): Luồng dữ liệu log liên tục của RTK và hội thoại của bạn phải nằm ở cuối cùng. Nếu bạn chèn log lên trên, toàn bộ Cache phía sau sẽ vỡ.  Điều chỉnh "Bánh răng" Caveman theo ngữ cảnh: Caveman hỗ trợ nhiều mức độ. Khi Agent tự nói chuyện với chính nó qua CLI (như trong Cline), hãy dùng /caveman ultra (tối giản nhất). Khi bạn yêu cầu Agent viết tài liệu hoặc giải thích code cho bạn đọc, hãy chuyển về /caveman lite hoặc tắt đi để văn phong dễ hiểu hơn.
+```
+
+Hiệu quả, so sánh
+?
+
+Khi nào thì không nên dùng:
+...
+
+
+Một chút thông tin khác liên quan đến cache prompting:
+Simulate quá trình prompt, gửi token, prefill, tạo KV cache
+
+Thông tin về static context? dynamic context?
+
+Tham khảo
+```
+Here is the step-by-step lifecycle of an agent session:Turn 1: The Initial Request1. What you send over the internet:You send one giant text package containing:[System Prompt] (The massive Rules file, persona, tool schemas)[User Message 1] (Your actual prompt)2. What the server does:The AI provider's server receives this payload. Because it has never seen it before, it performs a full prefill on the entire thing. It calculates the math for all of those tokens and stores the resulting states in the server's GPU RAM (the KV Cache).3. What you pay:You pay the standard, full price for every single input token (Rules + User Message 1).4. The Output:The AI generates its response ([Assistant Message 1]) one token at a time, adds it to the cache, and sends it back to your computer.{/* Reason: Visually reinforces that the local client must bundle the system rules, history, and new prompt into one giant package for every turn. */}Turn 2: The Magic of Caching1. What you send over the internet:You type your second prompt. Your local app bundles up everything that has happened so far and sends it over the internet. The payload looks like this:[System Prompt] (The exact same Rules file)[User Message 1][Assistant Message 1][User Message 2] (Your brand new prompt)2. What the server does:The server receives this massive payload. Before doing any math, it checks its Radix Tree memory. It realizes: "Wait a minute, I've already calculated the exact prefix of [System Prompt] + [User Message 1] + [Assistant Message 1] just a minute ago!"It instantly pulls those mathematical states from the KV Cache. It only has to prefill the handful of brand new tokens in [User Message 2]. It then appends those new tokens to the existing cache in memory.3. What you pay:You pay the heavily discounted "Cached Token" price for the Rules, User Message 1, and Assistant Message 1.You pay the standard "Input Token" price only for the brand new User Message 2.Turn 3 and BeyondThis cycle continues. By Turn 10, your local app is sending a truly massive payload over the internet containing the Rules and all 10 turns of conversation.But because the server has been keeping that exact sequence alive in its cache, it simply extends the cache by prefilling just your newest message. You continue to pay pennies on the dollar for the massive historical block, making long agent sessions highly affordable.The Expiration PenaltyYou are 100% correct about what happens when the cache drops.API providers cannot keep your conversation in their expensive GPU memory forever. If you step away to get a coffee and don't send a prompt for a certain amount of time (typically 5 minutes on standard tiers, up to 60 minutes on premium caching tiers), the server will evict your session to make room for other customers.If you come back 2 hours later and send Turn 11:Your app sends the massive history: [System Prompt] + [Turns 1 through 10] + [User Message 11].The server checks its memory, but your cache has been deleted.The server must now do a full prefill on the entire massive payload from scratch.You will be charged the full standard input token price for the entire history, which can be very expensive. After this expensive prefill, the cache is re-established, and Turn 12 will be cheap again.This is why, when working with AI agents like Cline, developers try to keep their sessions continuous. If they step away for too long, they often start a brand new session (clearing the history) to avoid paying a massive "re-caching" penalty when they return.
+```
+
+And the slide 
+
+Talk about the 5 minutes.
+
+The end?
+
+
+
+
+
+
+
+
+
+
+

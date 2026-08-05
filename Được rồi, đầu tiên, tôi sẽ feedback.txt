@@ -1,0 +1,22 @@
+Được rồi, đầu tiên, tôi sẽ feedback về slide này, nếu chỗ nào tôi yêu cầu ảnh, bạn không kiếm được ảnh phù hợp thì cứ để 1 chỗ cho ảnh đấy, tôi sẽ tìm ảnh phù hợp và thêm vào
+Phần BPE tôi muốn ví dụ nó cần phải được biểu diễn trực quan, dễ theo dõi và hiểu hơn chứ không mô tả bằng text như thế này.
+
+Cạm bẫy trắng cần ảnh minh họa
+
+Quá trình xử lý: Prefill vs Decode
+Cần ảnh minh họa (Gắn ở đính kèm)
+
+
+
+Lãng phí Token trong 3 Giai đoạn
+Mỗi giai đoạn cần ảnh minh họa
+
+Bộ 3 Công cụ Bao phủ Vòng đời AI Agent
+Làm thành 3 tầng theo chiều dọc, dựa vào từng lớp, xếp ở bên trái, bên phải sẽ mô tả
+
+Tips & Tricks Tối ưu (Synergy)
+phần này đang hơi chỉ có chữ, lý thuyết
+
+Nên tách Khi nào KHÔNG nên dùng ra một page riêng
+
+Phần simulate khi prompt vào Agent cần làm giống như slide mẫu tôi đã gửi lên ban đầu

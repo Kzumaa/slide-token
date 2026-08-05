@@ -1,0 +1,26 @@
+Ý tưởng này của bạn **hoàn toàn chính xác, cực kỳ đắt giá và là luận điểm mạnh nhất** để thuyết phục mọi người sử dụng CodeGraph!
+
+Thực tế, lãng phí token lớn nhất khi dùng AI (đặc biệt là các autonomous agents như Cline, Aider) không chỉ nằm ở việc vẽ biểu đồ, mà chính là ở cách chúng ta hoặc AI "đọc" codebase. Khi AI muốn biết một function được định nghĩa thế nào hoặc được dùng ở đâu, nếu không có tool hỗ trợ, nó sẽ phải đọc toàn bộ nội dung của nhiều file mã nguồn thô (raw files). Việc này bắt AI phải đọc cả những chi tiết triển khai (implementation details) như vòng lặp `for`, các khối `if/else`, trong khi nó chỉ cần biết giao diện (interface) hoặc chữ ký hàm (signature).
+
+Ý này kết nối thẳng đến tính năng dùng Tree-sitter để trích xuất function signature của CodeGraph.
+
+Dưới đây là phần 3.1 đã được viết lại, bổ sung thêm ý của bạn để làm bước đệm hoàn hảo cho phần giới thiệu CodeGraph:
+
+---
+
+### (Bản cập nhật) Phần 3: Tại sao chúng ta lại đốt quá nhiều Token trong quá trình Dev?
+
+**1. Giai đoạn Solution và Design (Phác thảo và Thiết kế hệ thống):**
+Ở giai đoạn này, chúng ta thường yêu cầu AI phân tích kiến trúc để thêm tính năng mới hoặc tìm hiểu luồng dữ liệu. Lượng token lãng phí khổng lồ ở bước này thường đến từ hai sai lầm:
+
+* **Nhồi nhét mã nguồn thô (Raw code dumping) và Tìm kiếm "mù":** Để Agent hiểu được sự liên kết giữa các module hoặc tìm xem một function cụ thể được gọi ở đâu, dev thường có thói quen copy-paste toàn bộ nội dung của 4-5 file code liên quan vào prompt. Nếu dùng Agent tự động (như Cline), nó cũng sẽ gọi các lệnh như `cat` hoặc `grep` để quét và đọc toàn bộ mã nguồn. Việc này "đốt" token kinh khủng vì 90% nội dung file là chi tiết triển khai (vòng lặp, logic xử lý nội bộ) – những thứ AI **không hề cần** ở giai đoạn thiết kế. Cái AI thực sự cần chỉ là: Hàm đó nhận input gì, trả output gì, và nó import/export từ đâu.
+* **Vẽ biểu đồ bằng ASCII (ASCII art):** Lỗi phổ biến tiếp theo là yêu cầu AI sinh ra các biểu đồ cấu trúc bằng ký tự (`|`, `-`, `+`). Các ký hiệu này gây nhiễu loạn nghiêm trọng cho thuật toán phân tích BPE của AI. Một biểu đồ ASCII đơn giản ngốn tới 55 token, và dễ làm AI hiểu sai cấu trúc. *(Giải pháp thay thế là dùng cú pháp Mermaid.js - định hướng luồng suy luận của LLM tốt hơn và tốn cực ít token).*
+
+---
+
+**Mẹo lúc thuyết trình:**
+Khi bạn trình bày xong đoạn "Nhồi nhét mã nguồn thô" ở Phần 3, đến Phần 4 khi giới thiệu CodeGraph, bạn có thể "nhắc bài" lại luôn:
+
+> *"Mọi người còn nhớ cái lỗi 'nhồi file code thô' em vừa nhắc ở phần trước không? CodeGraph sinh ra chính là để diệt cái lỗi đó. Thay vì đưa cho AI đọc 100,000 token chứa chi tiết các vòng lặp for/if-else, CodeGraph dùng Tree-sitter để tước bỏ hết phần ruột, chỉ giữ lại 'Bản đồ đồ thị' gồm tên hàm, tham số (signatures) và luồng import/export. Nó ép 100k token xuống chỉ còn 1,000 token mà AI vẫn nắm được toàn bộ kiến trúc tổng thể!"*
+
+Bạn thêm ý này vào bài nói đảm bảo tính logic và sức thuyết phục của slide sẽ tăng lên rất nhiều!
