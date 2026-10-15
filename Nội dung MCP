@@ -1,0 +1,973 @@
+Bản tài liệu tổng hợp hoàn chỉnh dưới đây đã được bổ sung mục **3.1. Lý thuyết chuyên sâu về các thành phần cốt lõi (MCP Host, MCP Client và MCP Server)** ngay đầu Phần 3 trước khi đi vào 2 tầng giao thức và Case Study GitHub MCP. Bạn có thể dùng trực tiếp tài liệu này làm kịch bản xuyên suốt cho buổi hội thảo 60 phút.
+
+---
+
+## Khung thời gian buổi trình bày (Agenda 60 Phút)
+
+| Thời lượng | Phần nội dung | Trọng tâm giải quyết |
+| --- | --- | --- |
+| **00:00 – 10:00** | **Phần 0: Từ điển thuật ngữ nền tảng** | Làm rõ `Agent Harness`, `JSON-RPC 2.0`, `STDIO`, `Streamable HTTP` và `Primitives`. |
+| **10:00 – 20:00** | **Phần 1: Tại sao MCP ra đời?** | Bài toán phân mảnh $M \times N$, sự hỗn loạn của "glue code" và ẩn dụ cổng USB-C. |
+| **20:00 – 30:00** | **Phần 2: Ranh giới của MCP & So sánh với HTTP API** | Sơ đồ chỉ rõ **MCP nằm ở đoạn nào** khi kết nối Postgres/Sentry; phân biệt với REST API. |
+| **30:00 – 48:00** | **Phần 3: Lý thuyết Host–Client–Server, 2 tầng giao thức & Case Study GitHub** | Lý thuyết 3 thực thể cốt lõi, sơ đồ bọc gói tin Data/Transport Layer, mổ xẻ file `mcp.json` của GitHub và luồng chạy 6 bước. |
+| **48:00 – 60:00** | **Phần 4: Chiến lược Production & Hỏi đáp "Bản chất"** | Thiết kế Internal Aggregator Server, tránh Context Bloat và trả lời các câu hỏi *"Tại sao?"* của Dev. |
+
+---
+
+## Phần 0 (00:00 – 10:00): Giải thích các thuật ngữ chuyên ngành (Glossary cho Dev)
+
+Trước khi bước vào kiến trúc MCP, việc thống nhất 5 thuật ngữ kỹ thuật dưới đây sẽ giúp người nghe nắm bắt nhanh toàn bộ nội dung phía sau:
+
+### 1. `Agent Harness` (hay `MCP Host` / Bộ khung điều phối Agent)
+
+* **Bản chất:** Bản thân mô hình ngôn ngữ lớn (LLM như Claude, GPT-4, Gemini) chỉ là một hàm suy luận nhận văn bản đầu vào và sinh văn bản đầu ra — nó không có bộ nhớ dài hạn và không thể tự chạy code hay mở kết nối mạng.
+* **Vai trò của Harness:** Là phần mềm bọc bên ngoài LLM (ví dụ: ứng dụng VS Code, Cursor, Claude Desktop, hoặc Backend Chatbot bạn tự code bằng Node.js/Python). Harness chịu trách nhiệm giữ mảng lịch sử hội thoại (`messages[]`), chạy vòng lặp suy luận (Agentic Loop), nhận yêu cầu dùng công cụ từ LLM và thực thi chúng. Trong kiến trúc MCP, Agent Harness đóng vai trò là **MCP Host**.
+
+### 2. `JSON-RPC 2.0` (Giao thức gọi hàm từ xa bằng JSON)
+
+* **Bản chất:** Khác với **REST API** xoay quanh tài nguyên (Resources) và dùng các động từ HTTP (`GET /users/1`, `POST /orders`, `DELETE /items/5`), **JSON-RPC 2.0** xoay quanh **Hành động / Lệnh gọi hàm (Remote Procedure Call)**.
+* **Đặc điểm:** Mọi thông điệp trong JSON-RPC 2.0 chỉ là một đối tượng JSON thuần túy có cấu trúc cố định gồm 4 trường:
+* `jsonrpc`: Luôn là `"2.0"`.
+* `method`: Tên hàm muốn gọi (ví dụ: `"tools/list"`, `"tools/call"`, `"server/discover"`).
+* `params`: Tham số truyền vào hàm đó.
+* `id`: Mã định danh của request để khớp với response trả về (nếu là thông báo một chiều `Notification` không cần phản hồi thì bỏ trống trường `id`).
+
+
+
+### 3. `Primitives` (Các nguyên hàm ngữ cảnh)
+
+* **Bản chất:** Trong khoa học máy tính, *Primitive* là những đơn vị cấu tạo cơ bản nhất mà một hệ thống cung cấp. Trong MCP, Primitives là **các kiểu dữ liệu và khả năng chuẩn hóa** mà Server và Client có thể trao đổi với nhau, bao gồm: `Tools` (Hàm thực thi), `Resources` (Dữ liệu/Tài liệu ngữ cảnh), `Prompts` (Mẫu câu lệnh) và `Elicitation` (Yêu cầu hỏi thêm thông tin từ người dùng).
+
+### 4. `STDIO` (Standard Input / Standard Output)
+
+* **Bản chất:** Là cơ chế giao tiếp liên tiến trình (Inter-Process Communication - IPC) có sẵn trong mọi hệ điều hành (Linux/macOS/Windows). Thay vì mở cổng mạng (như port `8080`), chương trình A khởi chạy chương trình B làm tiến trình con (child process), sau đó ghi thẳng chuỗi văn bản vào luồng nhập (`stdin`) của B và đọc kết quả từ luồng xuất (`stdout`) của B.
+
+### 5. `Streamable HTTP` & `SSE (Server-Sent Events)`
+
+* **Bản chất:** Là cơ chế giao tiếp qua mạng khi Client và Server nằm ở hai máy khác nhau. Client gửi yêu cầu bằng lệnh `HTTP POST` tiêu chuẩn; nếu Server cần trả về kết quả kéo dài theo thời gian thực (streaming hoặc thông báo), Server có thể giữ kết nối HTTP mở và đẩy từng dòng sự kiện về qua chuẩn **SSE (Server-Sent Events)**.
+
+---
+
+## Phần 1 (10:00 – 20:00): Đặt vấn đề — Tại sao MCP ra đời?
+
+### 1.1. Kịch bản thực tế & Cơn ác mộng tích hợp $M \times N$
+
+Hãy hình dung bạn cần xây dựng các ứng dụng AI Agent cho doanh nghiệp (ví dụ: một Chatbot chăm sóc khách hàng trên Web, kết hợp với việc đội ngũ kỹ sư dùng VS Code/Cursor và Claude Desktop để vận hành hệ thống). Các ứng dụng này đều cần tương tác với:
+
+* **PostgreSQL** (2 triệu đơn hàng) để tra cứu vận đơn.
+* **Elasticsearch** (500.000 sản phẩm) để tìm kiếm tồn kho.
+* **Stripe API** để hoàn tiền và **Slack API** để báo cho đội Finance.
+* **Sentry** để kiểm tra log lỗi hệ thống.
+
+Nếu không có một giao thức chuẩn ở giữa, với $M$ **ứng dụng AI (Hosts)** và $N$ **công cụ (Tools)**, các kỹ sư phải viết $M \times N$ bộ mã kết nối tùy chỉnh (**custom glue code**): mỗi ứng dụng AI phải tự viết lại trình đọc API, định nghĩa JSON Schema cho hàm, xử lý phân trang, bắt lỗi và quản lý xác thực cho từng công cụ.
+
+### 1.2. Ẩn dụ "Cổng USB-C" cho AI Agent
+
+* Trước khi có USB-C, mỗi thiết bị ngoại vi và mỗi quốc gia dùng một chuẩn chân cắm khác nhau — bạn phải mang theo hàng tá đầu chuyển đổi (adapters).
+* **MCP (Model Context Protocol)** đóng vai trò là **chuẩn cổng cắm USB-C** giữa thế giới AI và thế giới công cụ:
+* Mọi công cụ (Postgres, Sentry, GitHub, Stripe) chỉ cần cung cấp một đầu cắm chuẩn gọi là **MCP Server**.
+* Mọi ứng dụng AI (VS Code, Claude Desktop, Custom Chatbot) chỉ cần tích hợp cổng nhận chuẩn gọi là **MCP Client**.
+* Biến bài toán tích hợp từ tích số $M \times N$ thành tổng số $M + N$.
+
+
+
+---
+
+## Phần 2 (20:00 – 30:00): Ranh giới của MCP nằm ở đâu? & So sánh với HTTP API
+
+Các lập trình viên luôn hỏi một câu hỏi bản chất: *"Nếu MCP chỉ là một giao thức (Protocol), vậy khi AI Agent kết nối vào PostgreSQL hay Sentry, chính xác thì **MCP nằm ở đoạn nào** trên sơ đồ?"*
+
+### 2.1. Sơ đồ phân định ranh giới (The MCP Boundary Diagram)
+
+Hãy quan sát sơ đồ kết nối thực tế dưới đây khi một ứng dụng AI kết nối đồng thời tới **PostgreSQL** (chạy cục bộ/nội bộ) và **Sentry** (chạy trên Cloud):
+
+```
+====================================================================================================
+                  SƠ ĐỒ RANH GIỚI: ĐOẠN NÀO LÀ MCP, ĐOẠN NÀO KHÔNG PHẢI?
+====================================================================================================
+
+ [ NGƯỜI DÙNG ]
+       | (Chat: "Kiểm tra lỗi trên Sentry và đối chiếu đơn hàng #123 trong DB")
+       v
++--------------------------------------------------------------------------------------------------+
+|  1. MCP HOST / AGENT HARNESS (Ví dụ: VS Code, Claude Desktop, hoặc Python/Node.js Backend)       |
+|                                                                                                  |
+|  +---------------------------+      (Hàm nội bộ / SDK)       +--------------------------------+  |
+|  | Bộ điều phối & Giữ lịch sử|<----------------------------->|   LLM API (Claude/GPT/Gemini)  |  |
+|  | hội thoại (messages[])    |   [KHÔNG PHẢI MCP - Đây là    |   (Chỉ suy luận & trả về       |  |
+|  +-------------+-------------+    API riêng của hãng LLM]    |    Intent muốn gọi hàm gì)     |  |
+|                |                                             +--------------------------------+  |
+|                +------------------------------------+                                            |
+|                |                                    |                                            |
+|                v                                    v                                            |
+|     +--------------------+               +--------------------+                                  |
+|     |   MCP Client #1    |               |   MCP Client #2    |                                  |
+|     +---------+----------+               +---------+----------+                                  |
++---------------|------------------------------------|---------------------------------------------+
+                |                                    |
+================|====================================|==============================================
+   RANH GIỚI    |  <-- GIAO THỨC MCP (STDIO)         |  <-- GIAO THỨC MCP (Streamable HTTP)
+   CỦA MCP      |      Truyền JSON-RPC 2.0           |      Truyền JSON-RPC 2.0
+   NẰM Ở ĐÂY!   |      qua ống stdin / stdout        |      qua HTTP POST + SSE
+================|====================================|==============================================
+                v                                    v
+     +--------------------+               +--------------------+
+     | Postgres MCP Server|               | Sentry MCP Server  |
+     | (Process trên máy) |               | (Chạy trên Cloud)  |
+     +---------+----------+               +---------+----------+
+               |                                    |
+===============|====================================|===============================================
+  NGOÀI PHẠM   |  <-- Giao thức TCP/IP              |  <-- Giao thức HTTPS truyền thống
+  VI CỦA MCP   |      Truyền câu lệnh SQL gốc       |      Gọi REST API gốc của Sentry
+               |      (port 5432, giữ DB Password)  |      (Giữ Sentry Auth Token)
+               v                                    v
+     +--------------------+               +--------------------+
+     |  PostgreSQL DB     |               |  Sentry Platform   |
+     |  (Database thật)   |               |  (Hệ thống thật)   |
+     +--------------------+               +--------------------+
+
+```
+
+**Nhìn vào sơ đồ trên, ta rút ra 3 kết luận rõ ràng cho Developer:**
+
+1. **Giữa Host và LLM KHÔNG phải là MCP:** Đoạn ứng dụng của bạn gửi prompt lên OpenAI/Anthropic/Google vẫn dùng SDK/API riêng của từng hãng LLM. LLM hoàn toàn không mở kết nối tới MCP Server.
+2. **Giữa MCP Server và Database/Dịch vụ gốc KHÔNG phải là MCP:** Đoạn từ `Postgres MCP Server` xuống `PostgreSQL DB` vẫn dùng driver SQL truyền thống (port 5432). Đoạn từ `Sentry MCP Server` tới `Sentry` vẫn dùng REST API nội bộ của Sentry.
+3. **MCP nằm chính xác ở giữa `MCP Client` và `MCP Server`:** MCP định nghĩa bộ quy tắc đóng gói bản tin **JSON-RPC 2.0** chạy trên đường dây nối giữa Client (nằm trong Host) và Server (đứng trước công cụ). Chính nhờ chuẩn hóa "khúc giữa" này mà bạn có thể tháo lắp bất kỳ công cụ nào vào bất kỳ ứng dụng AI nào.
+
+---
+
+### 2.2. Tại sao đã có HTTP/REST API lại cần lớp MCP Server đứng chắn phía trước?
+
+MCP **không thay thế** REST API gốc, mà đóng vai trò là lớp **Smart Adapter (Bộ chuyển đổi thông minh)** giải quyết 3 vấn đề mà REST API truyền thống không được thiết kế để xử lý:
+
+| Vấn đề | Gọi thẳng HTTP / REST API truyền thống | Có MCP Server đứng làm trung gian |
+| --- | --- | --- |
+| **1. Định dạng dữ liệu (Human-speak vs. AI-speak)** | Thiết kế cho code của con người parse. Ví dụ: Gọi Kubernetes API lấy trạng thái Pod trả về hàng trăm dòng JSON lồng nhau. Đẩy thẳng vào LLM sẽ làm tràn Context Window và gây ảo giác (hallucination). | **Biên dịch sang AI-speak:** Người viết MCP Server lọc bỏ dữ liệu thừa và chỉ trả về văn bản tinh gọn cho LLM: `"Pod my-app is running, 3/3 containers ready, no restarts, uptime 2h"`. |
+| **2. Khám phá công cụ (Static vs. Dynamic Discovery)** | **Tĩnh (Giống thực đơn in sẵn):** Dev phải đọc tài liệu API rồi gõ cứng (hardcode) từng URL endpoint và JSON Schema vào trong code của Agent. | **Động tại Runtime (Giống người phục vụ bàn):** Khi khởi động, MCP Client chỉ cần gọi hàm `tools/list` qua MCP để tự động lấy toàn bộ danh sách công cụ và Schema mới nhất từ Server mà không cần sửa code ứng dụng. |
+| **3. Cô lập bảo mật (Credential Isolation)** | Ứng dụng AI Host phải trực tiếp lưu giữ toàn bộ chuỗi kết nối DB, API keys của hàng chục dịch vụ khác nhau. | **Cô lập Secrets tại Server:** Mật khẩu DB hay API Key nằm kín bên trong từng MCP Server. Host và LLM chỉ gửi tên hàm và tham số nghiệp vụ; MCP Server tự kiểm tra quyền rồi mới gắn key để gọi hệ thống gốc. |
+
+---
+
+## Phần 3 (30:00 – 48:00): Kiến trúc Host–Client–Server, 2 Tầng Giao Thức & Case Study GitHub MCP
+
+### 3.1. Lý thuyết 3 thành phần cốt lõi: MCP Host, MCP Client và MCP Server
+
+Theo đặc tả kiến trúc MCP (`2026-07-28`), hệ thống tuân theo mô hình kiến trúc Client–Server nhưng được chia thành **3 thực thể riêng biệt** (thay vì 2 như web truyền thống). Rất nhiều lập trình viên khi mới đọc tài liệu thường nhầm lẫn giữa **MCP Host** và **MCP Client**.
+
+Hãy nhìn vào sơ đồ quan hệ giữa 3 thành phần này:
+
+```
++-------------------------------------------------------------------------+
+| 1. MCP HOST (Ứng dụng AI trung tâm: VS Code, Claude Desktop, Backend)   |
+|    - Quản lý giao diện người dùng (UI) & Lịch sử hội thoại (messages[]) |
+|    - Điều phối vòng lặp gọi LLM (Agentic Loop)                          |
+|    - Khởi tạo và quản lý vòng đời của các MCP Client                    |
+|                                                                         |
+|   +---------------------+  +---------------------+  +---------------+   |
+|   |   2. MCP CLIENT A   |  |   2. MCP CLIENT B   |  | 2. MCP CLIENT C|  |
+|   | (Kết nối 1-1 độc lập|  | (Kết nối 1-1 độc lập|  | (Kết nối 1-1) |   |
+|   +----------+----------+  +----------+----------+  +-------+-------+   |
++--------------|------------------------|---------------------|-----------+
+               |                        |                     |
+      (STDIO Transport)        (STDIO Transport)    (Streamable HTTP Transport)
+               |                        |                     |
+               v                        v                     v
+    +---------------------+  +---------------------+  +-------------------+
+    |   3. MCP SERVER A   |  |   3. MCP SERVER B   |  |  3. MCP SERVER C  |
+    |  (Local Filesystem) |  |  (Local PostgreSQL) |  |  (Remote Sentry)  |
+    +---------------------+  +---------------------+  +-------------------+
+
+```
+
+Dưới đây là vai trò lý thuyết và trách nhiệm kỹ thuật của từng thành phần:
+
+#### A. MCP Host (Ứng dụng chủ điều phối AI)
+
+* **Định nghĩa:** Là ứng dụng AI tổng thể mà người dùng trực tiếp tương tác (ví dụ: Claude Desktop, Claude Code, VS Code, Cursor, hoặc hệ thống AI Agent Backend do bạn tự xây dựng).
+* **Trách nhiệm kỹ thuật:**
+1. **Quản lý trạng thái hội thoại (State & Memory Management):** Giữ lịch sử chat (`messages[]`) và kết quả trả về từ các lần gọi tool trước đó để gửi kèm lên LLM ở các lượt hỏi tiếp theo.
+2. **Quản lý kết nối đa nguồn:** Một MCP Host có thể kết nối tới nhiều MCP Server cùng lúc. Mỗi khi cần kết nối tới một MCP Server mới, runtime của Host sẽ tự động khởi tạo một thực thể **MCP Client** tương ứng.
+3. **Tổng hợp ngữ cảnh & Điều phối LLM:** Host gom toàn bộ danh sách công cụ (`Tools`), tài nguyên (`Resources`) từ tất cả các MCP Client đang hoạt động để cung cấp cho LLM, đồng thời đứng ra xin phép người dùng (user approval/permissions) trước khi cho phép thực thi các hành động nhạy cảm.
+
+
+
+#### B. MCP Client (Bộ kết nối giao thức 1-1 nằm trong Host)
+
+* **Định nghĩa:** Là thành phần phần mềm (thường là một class/instance từ MCP SDK) nằm **bên trong MCP Host**, chịu trách nhiệm duy trì một **kết nối chuyên biệt 1-1 (dedicated one-to-one connection)** với duy nhất một MCP Server.
+* **Tại sao phải tách riêng MCP Client khỏi MCP Host?**
+* Trong khi **Host** lo bài toán nghiệp vụ AI (nói chuyện với người dùng, gọi LLM, gom nhóm công cụ), thì **Client** thuần túy lo bài toán **giao thức mạng (Protocol Handler)** với một Server cụ thể.
+* Nếu Host nối với 3 Server (Filesystem, Postgres, Sentry), Host sẽ tạo ra 3 instance `MCP Client` độc lập.
+
+
+* **Trách nhiệm kỹ thuật:**
+1. Đóng gói và giải mã các bản tin JSON-RPC 2.0 gửi đi và nhận về từ Server mà nó phụ trách.
+2. Thực hiện pha khám phá năng lực (`server/discover`) để biết Server đó hỗ trợ phiên bản MCP nào và có những tính năng gì, sau đó lưu cache thông tin này.
+3. Duy trì luồng lắng nghe thông báo thời gian thực (`subscriptions/listen`) từ Server và xử lý các yêu cầu hỏi ngược từ Server (`elicitation/create`) để chuyển lên cho Host hiển thị ra màn hình.
+
+
+
+#### C. MCP Server (Chương trình cung cấp ngữ cảnh và công cụ)
+
+* **Định nghĩa:** Là một chương trình độc lập đứng chắn trước một nguồn dữ liệu hoặc dịch vụ (như Database, GitHub, Sentry, Hệ thống file), có nhiệm vụ phơi bày (expose) các khả năng của hệ thống đó ra ngoài theo chuẩn giao thức MCP.
+* **Hai mô hình triển khai của MCP Server:**
+1. **Local MCP Server (Chạy cục bộ):** Chạy trên cùng một máy tính với MCP Host (thường được Host khởi chạy dưới dạng một tiến trình con qua câu lệnh `npx`, `uvx`, `python`, hoặc `docker run`) và giao tiếp qua **STDIO Transport**. Một Local MCP Server thường chỉ phục vụ duy nhất 1 MCP Client đã bật nó lên. Ví dụ: Filesystem MCP Server dùng để đọc/ghi file ngay trên ổ cứng máy tính của bạn.
+2. **Remote MCP Server (Chạy từ xa):** Chạy trên một máy chủ độc lập hoặc hạ tầng Cloud (ví dụ: Sentry MCP Server hay GitHub Remote MCP Server) và giao tiếp qua mạng bằng **Streamable HTTP Transport**. Khác với bản Local, một Remote MCP Server có thể phục vụ **nhiều MCP Client** từ nhiều người dùng khác nhau cùng lúc.
+
+
+
+---
+
+### 3.2. Sơ đồ giải phẫu "2 Tầng Giao Thức": Giao thức nằm ở chỗ nào?
+
+Tài liệu [MCP Architecture (2026-07-28)](https://modelcontextprotocol.io/docs/2026-07-28/learn/architecture) chia giao thức chạy giữa `MCP Client` và `MCP Server` thành 2 tầng: **Data Layer (Tầng trong)** và **Transport Layer (Tầng ngoài)**. Hãy hình dung nó giống như **một bức thư (Data Layer)** được bỏ vào trong **một phong bì vận chuyển (Transport Layer)**:
+
+```
++-----------------------------------------------------------------------------------+
+| TẦNG NGOÀI: TRANSPORT LAYER (Cơ chế vận chuyển & Bảo mật đường truyền)            |
+| - Cách 1 (Local): Ống dẫn STDIO (stdin/stdout) giữa 2 process trên cùng 1 máy.    |
+| - Cách 2 (Remote): Gói tin HTTP POST + Server-Sent Events (SSE) kèm OAuth/Bearer. |
+|                                                                                   |
+|   +---------------------------------------------------------------------------+   |
+|   | TẦNG TRONG: DATA LAYER (Ngôn ngữ giao tiếp chung - JSON-RPC 2.0)          |   |
+|   | Mọi thông điệp đều có cấu trúc JSON-RPC 2.0 giống hệt nhau bất kể         |   |
+|   | tầng ngoài dùng STDIO hay HTTP:                                           |   |
+|   |                                                                           |   |
+|   |  1. _meta (Stateless Metadata): Phiên bản "2026-07-28", thông tin Client  |   |
+|   |  2. Discovery: Hàm "server/discover" để hỏi phiên bản & năng lực Server   |   |
+|   |  3. Server Primitives:                                                    |   |
+|   |     - Tools ("tools/list", "tools/call"): Hàm thực thi hành động          |   |
+|   |     - Resources ("resources/list", "resources/get"): Đọc file, DB schema  |   |
+|   |     - Prompts ("prompts/list", "prompts/get"): Mẫu prompt đóng gói sẵn    |   |
+|   |  4. Client Primitives:                                                    |   |
+|   |     - Elicitation ("elicitation/create"): Server hỏi xác nhận từ User     |   |
+|   |  5. Notifications ("subscriptions/listen"): Báo khi danh sách tool đổi    |   |
+|   +---------------------------------------------------------------------------+   |
++-----------------------------------------------------------------------------------+
+
+```
+
+> **Lưu ý quan trọng từ Spec `2026-07-28`:**
+> * **Tính chất Stateless ở tầng Data Layer:** Mỗi gói tin JSON-RPC gửi đi đều tự đính kèm trường `_meta` chứa phiên bản giao thức (`"2026-07-28"`), định danh (`clientInfo`) và năng lực của Client (`clientCapabilities`). Nhờ đó, Server có thể xử lý độc lập từng gói tin mà không cần lưu trạng thái kết nối ngầm.
+> * **Các tính năng đã bị loại bỏ (Deprecated):** Từ bản `2026-07-28`, hai tính năng cũ của Client là `Sampling` (Server mượn LLM của Client) và `Logging` (gửi log qua MCP) đã bị **deprecated**. Server cần dùng LLM thì gọi thẳng API của hãng LLM; cần ghi log thì xuất ra `stderr` hoặc dùng **OpenTelemetry**.
+> 
+> 
+
+---
+
+### 3.3. Case Study thực tiễn: Giải phẫu GitHub MCP Server
+
+Để thấy toàn bộ lý thuyết về **Host – Client – Server** và **2 tầng giao thức** hoạt động thế nào trong thực tế, hãy xét ví dụ kết nối IDE (**VS Code / Cursor**) với **GitHub MCP Server**:
+
+| Thành phần lý thuyết | Thực thể ngoài đời thực (Trong ví dụ GitHub) | Ai là người viết code phần này? |
+| --- | --- | --- |
+| **1. MCP Host** | Phần mềm **VS Code** hoặc **Cursor** đang mở trên máy bạn. Nó quản lý khung chat, giữ lịch sử hội thoại và gọi LLM. | Đội ngũ phát triển VS Code / Cursor đã viết sẵn. |
+| **2. MCP Client** | Một **module ngầm nằm bên trong VS Code/Cursor**. Khi đọc file config thấy khai báo GitHub MCP, VS Code tự động đẻ ra 1 instance `MCP Client` chuyên giữ đường truyền nối tới GitHub MCP Server. | Có sẵn bên trong Host. **Bạn không phải code phần này khi dùng IDE.** |
+| **3. MCP Server** | Chương trình **`github-mcp-server`** (do chính GitHub viết bằng Go và phát hành). Nó nhận lệnh chuẩn MCP từ VS Code, rồi dịch thành các lệnh gọi **GitHub REST/GraphQL API** thật sự. | Đội ngũ **GitHub** đã viết sẵn. |
+
+Lập trình viên **không cần viết một dòng code nào** để tạo ra Client hay Server, mà chỉ cần khai báo file cấu hình `.vscode/mcp.json`. Nhìn vào 2 cách viết file config dưới đây, ta thấy ngay sự khác biệt giữa **Local Server (STDIO)** và **Remote Server (Streamable HTTP)**:
+
+```json
+{
+  "mcpServers": {
+    // CÁCH 1: Chạy Local MCP Server qua tầng vận chuyển STDIO
+    "github-local": {
+      "type": "stdio",
+      "command": "docker",
+      "args": [
+        "run", "-i", "--rm",
+        "-e", "GITHUB_PERSONAL_ACCESS_TOKEN",
+        "ghcr.io/github/github-mcp-server",
+        "stdio",
+        "--toolsets=issues,pull_requests,repos"
+      ],
+      "env": {
+        "GITHUB_PERSONAL_ACCESS_TOKEN": "ghp_xxxxxxxxxxxxxxxxxxxx"
+      }
+    },
+
+    // CÁCH 2: Kết nối Remote MCP Server qua tầng vận chuyển Streamable HTTP
+    "github-remote": {
+      "type": "http",
+      "url": "https://api.githubcopilot.com/mcp/",
+      "headers": {
+        "Authorization": "Bearer ghp_xxxxxxxxxxxxxxxxxxxx",
+        "X-MCP-Toolsets": "issues,pull_requests",
+        "X-MCP-Readonly": "true"
+      }
+    }
+  }
+}
+
+```
+
+**File config này đã định nghĩa những gì?**
+
+1. **Cách giao tiếp (Transport):** Ở `github-local`, VS Code dùng `docker run -i` để bật container ngay trên máy bạn và nói chuyện qua ống `stdio`. Ở `github-remote`, VS Code gửi request qua mạng tới URL của GitHub bằng giao thức `http`.
+2. **Cô lập khóa bảo mật (`GITHUB_PERSONAL_ACCESS_TOKEN`):** Token của bạn được truyền riêng cho MCP Server. Mô hình AI (Claude/GPT) không bao giờ nhìn thấy chuỗi `ghp_xxx` này.
+3. **Giới hạn phạm vi công cụ (`--toolsets` & `X-MCP-Readonly`):** Chỉ nạp các công cụ thuộc nhóm `issues` và `pull_requests` (tránh làm tràn bộ nhớ của LLM bởi hàng trăm API khác của GitHub), đồng thời cờ `Readonly: true` khóa chặt không cho AI thực hiện các lệnh ghi/xóa trên kho code.
+
+---
+
+### 3.4. Luồng chạy thực tế 6 bước (End-to-End Trace) kèm gói tin JSON-RPC
+
+Giả sử bạn gõ vào khung chat của VS Code:
+
+> *"Hãy đọc Issue #42 trong repo `my-org/payment-api` xem lỗi gì, sau đó kiểm tra file code gây lỗi và bình luận hướng sửa vào Issue đó."*
+
+Dưới đây là 6 bước diễn ra bên dưới hệ thống:
+
+* **Bước 1 — Khởi tạo & Khám phá (`server/discover` & `tools/list`):**
+Khi VS Code khởi động, MCP Client gửi bản tin JSON-RPC xuống `github-mcp-server`:
+```json
+{
+  "jsonrpc": "2.0",
+  "id": 1,
+  "method": "tools/list",
+  "params": {
+    "_meta": {
+      "io.modelcontextprotocol/protocolVersion": "2026-07-28",
+      "io.modelcontextprotocol/clientInfo": { "name": "vscode", "version": "1.99.0" }
+    }
+  }
+}
+
+```
+
+
+`github-mcp-server` trả về danh sách các hàm (`get_issue`, `get_file_contents`, `add_issue_comment`...) kèm JSON Schema quy định từng hàm cần tham số gì.
+* **Bước 2 — Đóng gói Prompt gửi cho LLM:**
+VS Code (Host) gửi câu hỏi của bạn kèm danh sách Tool Schema vừa lấy được lên cho mô hình LLM.
+* **Bước 3 — LLM ra quyết định (Intent Decision):**
+LLM đọc câu hỏi và trả về **ý định (Intent)**: *"Tôi muốn gọi tool `get_issue` với `owner: 'my-org'`, `repo: 'payment-api'`, `issue_number: 42`"*.
+* **Bước 4 — Host thực thi qua MCP (`tools/call`):**
+VS Code chuyển yêu cầu đó cho MCP Client để bắn gói tin JSON-RPC `tools/call` xuống `github-mcp-server`:
+```json
+{
+  "jsonrpc": "2.0",
+  "id": 2,
+  "method": "tools/call",
+  "params": {
+    "_meta": { "io.modelcontextprotocol/protocolVersion": "2026-07-28" },
+    "name": "get_issue",
+    "arguments": { "owner": "my-org", "repo": "payment-api", "issue_number": 42 }
+  }
+}
+
+```
+
+
+`github-mcp-server` dùng Token nội bộ gọi GitHub API, lọc lấy nội dung chính của Issue #42 (*"Lỗi chia cho 0 tại file `discount.py` dòng 50"*) và trả về cho VS Code.
+* **Bước 5 — Nối chuỗi hành động tự động (Multi-step trong Agent Harness):**
+VS Code (Host) lưu kết quả Issue #42 vào mảng lịch sử hội thoại `messages[]` và gửi lại cho LLM. Nhờ nhìn thấy tên file `discount.py` trong lịch sử hội thoại, LLM lập tức yêu cầu gọi tiếp `get_file_contents(path: 'discount.py')`, phân tích code lỗi và gọi tiếp `add_issue_comment` để đăng lời giải lên Issue #42.
+* **Bước 6 — Hoàn tất & Phản hồi:**
+LLM tổng hợp kết quả và báo lại cho bạn trên màn hình VS Code rằng đã comment hướng sửa lỗi xong.
+
+---
+
+## Phần 4 (48:00 – 60:00): Chiến lược Production & Giải đáp các câu hỏi "Tại sao?"
+
+### 4.1. Chiến lược đưa MCP vào Production cho Doanh nghiệp
+
+1. **Phân loại nguồn MCP Server:**
+* *Official Enterprise Servers (Ưu tiên số 1):* Do chính hãng phát triển (GitHub, Stripe, Sentry, Cloudflare) — chất lượng tương đương Official SDK.
+* *Reference / Community Open-source Servers:* Tốt để học hỏi hoặc chạy thử nghiệm nhanh, nhưng cần kiểm tra kỹ mã nguồn và cơ chế bảo trì trước khi đưa lên Production.
+
+
+2. **Mô hình Internal Aggregator MCP Server:**
+* Thay vì bắt mỗi dự án cài đặt 5–6 MCP Server rời rạc cho các dịch vụ nội bộ (Database, K8s, ERP, Slack), đội ngũ Platform/Backend nên xây dựng **một Custom Internal MCP Server** gom các nghiệp vụ cốt lõi của công ty lại.
+* **Nhúng cứng Business Logic & Guardrails vào Code:** Đặt các quy tắc kiểm soát an toàn ngay trong code của MCP Server (ví dụ: *"Không cho phép thực thi tool `restart_pod` trên cụm Production trong giờ hành chính"*, kèm Rate Limiting và Audit Logs) thay vì chỉ dặn dò lỏng lẻo trong System Prompt của LLM.
+* **Tránh bẫy Context Bloat (Phình đại ngữ cảnh):** Không bao giờ nhồi hàng trăm tools vào một phiên làm việc của LLM. Hãy chia nhỏ theo nhóm chức năng (`toolsets`) tương tự cách GitHub MCP Server thiết kế.
+
+
+
+---
+
+### 4.2. Bốn câu hỏi "Tại sao / Bản chất" mà các Developer hay thắc mắc nhất
+
+#### Câu hỏi 1: *"Tại sao MCP lại chọn JSON-RPC 2.0 mà không dùng chuẩn REST API (GET, POST, PUT, DELETE) cho quen thuộc?"*
+
+* **Trả lời:** Có 3 lý do kỹ thuật cốt lõi:
+1. **Độc lập với tầng vận chuyển (Transport-agnostic):** REST bị trói chặt vào giao thức HTTP (cần URL path, HTTP methods, HTTP headers, status codes 200/404/500). Trong khi đó, các công cụ chạy cục bộ trên máy dev giao tiếp qua ống `STDIO` (stdin/stdout) không hề có URL hay HTTP Header. JSON-RPC 2.0 gói toàn bộ tên hàm và tham số vào trong 1 chuỗi văn bản JSON duy nhất, nên truyền qua ống `STDIO`, `WebSockets` hay `HTTP` đều giống hệt nhau.
+2. **Giao tiếp hai chiều (Bi-directional):** Trong REST truyền thống, chỉ có Client gọi Server. Nhưng trong MCP, đôi khi **Server cần chủ động gọi ngược về Client** (ví dụ: tính năng `elicitation/create` để Server bật popup hỏi người dùng xác nhận, hoặc bắn `notifications`). Với JSON-RPC 2.0, cả Client và Server đều ngang hàng trong việc gửi/nhận bản tin.
+3. **Khớp tự nhiên với tư duy Function Calling của LLM:** LLM tư duy theo kiểu *"Gọi hàm tên là X với bộ tham số Y"*, trùng khớp 1:1 với cấu trúc `{"method": "X", "params": Y}` của JSON-RPC.
+
+
+
+#### Câu hỏi 2: *"Tại sao đối với các Local MCP Server, người ta lại dùng `STDIO` (stdin/stdout) mà không mở đại một cổng `localhost:8080` chạy HTTP?"*
+
+* **Trả lời:**
+1. **Không lo đụng độ cổng (Zero Port Conflicts):** Nếu bạn mở 3 cửa sổ VS Code, mỗi cửa sổ dùng 5 MCP Server khác nhau, việc quản lý xem server nào chiếm port `8080`, `8081`, `8082` là cực kỳ phiền phức. Với `STDIO`, Host cứ đẻ ra child process là nối ống nói chuyện trực tiếp.
+2. **Bảo mật cấp độ hệ điều hành (OS-level Security):** Nếu mở port `localhost`, bất kỳ phần mềm độc hại hay tab trình duyệt nào trên máy (qua lỗ hổng SSRF/CSRF) cũng có thể lén gọi vào port đó. Với `STDIO`, chỉ có duy nhất tiến trình cha (VS Code) mới giữ đầu ống `stdin/stdout` của tiến trình con.
+3. **Quản lý vòng đời tự động (Lifecycle Management):** Khi bạn tắt VS Code, tiến trình con chạy qua `STDIO` tự động kết thúc theo, không để lại các tiến trình chạy ngầm tốn tài nguyên.
+
+
+
+#### Câu hỏi 3: *"Tại sao trong 1 ứng dụng Host (như VS Code), khi kết nối tới 3 MCP Server thì phải tạo ra 3 đối tượng MCP Client riêng biệt (quan hệ 1-1), mà không dùng 1 MCP Client gọi cả 3 Server?"*
+
+* **Trả lời:**
+* Mỗi MCP Server có thể dùng một phương thức vận chuyển hoàn toàn khác nhau (Server A chạy Docker qua `STDIO`, Server B chạy Python script qua `STDIO`, Server C nằm trên Cloud qua `Streamable HTTP`), chạy phiên bản giao thức khác nhau và có danh sách `capabilities` khác nhau.
+* Việc thiết kế mỗi `MCP Client` là một đối tượng quản lý kết nối chuyên biệt 1-1 giúp **cô lập lỗi (Fault Isolation)**: nếu kết nối tới Server B bị treo hoặc crash, chỉ có `MCP Client #2` bị ảnh hưởng, còn `MCP Client #1` và `#3` vẫn hoạt động bình thường. **MCP Host** sẽ đứng ở tầng trên cùng để gom công cụ từ cả 3 Client lại cho LLM.
+
+
+
+#### Câu hỏi 4: *"Tóm lại, trong công việc thực tế, khi nào tôi chỉ cần VIẾT FILE CONFIG, và khi nào tôi phải VIẾT CODE cho MCP?"*
+
+* **Trả lời:** Hãy chia làm 3 cấp độ:
+1. **Cấp độ 1 — Dùng AI sẵn có kết nối vào công cụ phổ biến** (Ví dụ: Dùng VS Code / Cursor / Claude kết nối vào GitHub, Postgres, Sentry, Jira): **Không cần code một dòng nào.** Chỉ cần tải MCP Server chính hãng về và khai báo vào file `mcp.json`.
+2. **Cấp độ 2 — Dùng AI sẵn có kết nối vào Hệ thống Nội bộ của công ty** (Ví dụ: Muốn VS Code hoặc Claude đọc được hệ thống ERP/API riêng của công ty bạn): Bạn chỉ cần dùng SDK (`FastMCP` trong Python hoặc `@modelcontextprotocol/sdk` trong TypeScript) để **code một MCP Server nhỏ** bọc lấy API nội bộ của công ty.
+3. **Cấp độ 3 — Tự xây dựng Sản phẩm AI Agent riêng cho khách hàng** (Ví dụ: Tự viết Chatbot Backend riêng của công ty bằng Python/Node.js): Lúc này ứng dụng của bạn đóng vai trò là **MCP Host**, bạn sẽ nhúng thư viện **MCP Client SDK** vào Backend của mình để nó có thể cắm vào bất kỳ MCP Server nào.
+
+
+
+
+
+
+
+----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------
+Bạn nói hoàn toàn đúng! Mạch kể chuyện tự nhiên và sắc bén nhất là:
+
+1. **Nêu bài toán ($M \times N$)** $\rightarrow$ **Đưa ra giải pháp ngay (MCP là cổng USB-C)** $\rightarrow$ **Sau đó mới đặt câu hỏi phản biện: *"Ủa, đã có HTTP/REST API rồi, khác biệt giữa MCP và API truyền thống là gì?"*** (dùng đúng bảng đối chiếu **Khác biệt / So sánh** như trong tài liệu).
+2. Ở **Slide 7**, tuyệt đối bỏ các câu chữ tham chiếu gượng gạo kiểu *"chính là cái X ở Phần 1"*, mà trình bày độc lập, chuyên nghiệp và trực diện.
+
+Dưới đây là bản thiết kế **16 Slides** đã được chỉnh sửa chuẩn xác theo đúng góp ý của bạn:
+
+---
+
+## PHẦN 1: BÀI TOÁN TÍCH HỢP, GIẢI PHÁP MCP & SỰ KHÁC BIỆT VỚI REST API (00:00 – 15:00)
+
+### Slide 1: Trang bìa (Title Slide)
+
+* **Chữ trên Slide:**
+* **MODEL CONTEXT PROTOCOL (MCP)**
+* *Chuẩn kết nối AI Agent với Thế giới Công cụ (Spec 2026-07-28)*
+
+
+* **Khung Thiết Kế Hình Ảnh Trên Slide:**
+
+```text
++-----------------------------------------------------------------------+
+|                                                                       |
+|     [ Icon Bộ Não AI ]                       [ Cụm Icon Công Cụ ]     |
+|     (Claude / GPT / Gemini)                  (Postgres / GitHub / K8s)|
+|              \                                      /                 |
+|               \          +--------------+          /                  |
+|                =========>|  CỔNG USB-C  |<=========                   |
+|                          |    ( M C P ) |                             |
+|                          +--------------+                             |
+|                                                                       |
+|              MODEL CONTEXT PROTOCOL TRONG AI AGENT                    |
++-----------------------------------------------------------------------+
+
+```
+
+* **Lời dẫn (Speaker Notes):** Chào mừng mọi người. Hôm nay chúng ta sẽ đi từ bài toán thực tế khi xây dựng AI Agent để hiểu tại sao chuẩn giao tiếp MCP ra đời, sự khác biệt của nó với HTTP API truyền thống và cách áp dụng vào công việc hằng ngày.
+
+---
+
+### Slide 2: Nền tảng cốt lõi — `Mô hình LLM` vs. `Agent Harness`
+
+* **Chữ trên Slide:**
+* **LLM ≠ AI Agent**
+* **LLM:** Chỉ suy luận chữ • **Agent Harness:** Giữ trí nhớ & Gọi công cụ
+
+
+* **Khung Thiết Kế Hình Ảnh Trên Slide:**
+
+```text
++-----------------------------------------------------------------------+
+|   BỘ NÃO TRONG BÌNH KÍNH                  PHẦN MỀM ĐIỀU PHỐI BỌC NGOÀI|
+|                                                                       |
+|      +---------------+               +-----------------------------+  |
+|      |   (BỘ NÃO)    |               |       AGENT HARNESS         |  |
+|      |    L L M      |               |   (VS Code / Chatbot App)   |  |
+|      +---------------+               |                             |  |
+|      - Stateless (Không trí nhớ)     |  🗂️ Giữ lịch sử chat        |  |
+|      - Không tự gọi mạng được        |  🔄 Chạy vòng lặp Agent     |  |
+|      - Chỉ nhận Text -> trả Text     |  🔌 Kết nối DB / API ngoài  |  |
+|                                      +-----------------------------+  |
++-----------------------------------------------------------------------+
+
+```
+
+* **Lời dẫn (Speaker Notes):** Trước hết, ta thống nhất một khái niệm nền tảng: Mô hình LLM (như Claude, GPT-4, Gemini) chỉ là "bộ não trong bình kính" — nó không có bộ nhớ giữa các lần gọi và không thể tự mở kết nối tới Database hay API. Phần mềm bọc bên ngoài LLM (như VS Code, Cursor hay Backend Chatbot của bạn) được gọi là **Agent Harness**. Chính lớp phần mềm này mới là nơi lưu giữ lịch sử hội thoại và thay mặt LLM gọi ra các công cụ bên ngoài.
+
+---
+
+### Slide 3: Bài toán thực tế — Ma trận tích hợp $M \times N$
+
+* **Chữ trên Slide:**
+* **Bài toán: Cơn ác mộng $M \times N$ Glue Code**
+* *Mỗi ứng dụng AI phải tự viết lại code kết nối cho từng công cụ*
+
+
+* **Khung Thiết Kế Hình Ảnh Trên Slide:**
+
+```text
++-----------------------------------------------------------------------+
+|   M ỨNG DỤNG AI                            N CÔNG CỤ & DỮ LIỆU        |
+|                                                                       |
+|   [ Chatbot CSKH ]  ------------------>  [ PostgreSQL (2M orders) ]   |
+|          \         \    (12 nhánh        [ Elasticsearch (500k SP)]   |
+|   [ VS Code IDE  ] --X--- code tự chế    [ Stripe API (Refund)    ]   |
+|          /         /     chằng chịt)     [ Slack / Sentry API     ]   |
+|   [ DevOps Agent ]  ------------------>                               |
+|                                                                       |
+|          ⚠️ Khác Auth  |  ⚠️ Khác Schema  |  ⚠️ Khác Error Format     |
++-----------------------------------------------------------------------+
+
+```
+
+* **Lời dẫn (Speaker Notes):** Hãy nhìn vào bài toán thực tế: Công ty bạn có dữ liệu nằm ở PostgreSQL, Elasticsearch, Stripe và Slack. Khi có 3 ứng dụng AI khác nhau cùng muốn truy cập vào 4 nguồn này, các lập trình viên phải viết $3 \times 4 = 12$ bộ code tích hợp (glue code) riêng biệt — mỗi nơi một kiểu xác thực, định dạng dữ liệu và xử lý lỗi khác nhau.
+
+---
+
+### Slide 4: Giải pháp MCP — "Cổng USB-C" chuẩn hóa kết nối
+
+* **Chữ trên Slide:**
+* **Giải pháp: Model Context Protocol (MCP)**
+* *Chuẩn hóa giao tiếp như cổng USB-C • Biến $M \times N$ thành $M + N$*
+
+
+* **Khung Thiết Kế Hình Ảnh Trên Slide:**
+
+```text
++-----------------------------------------------------------------------+
+|   [ Chatbot CSKH ]      [ VS Code / Cursor ]      [ Claude Desktop ]  |
+|          |                       |                        |           |
+|          +-----------------------+------------------------+           |
+|                                  |                                    |
+|                                  v                                    |
+|        ======================================================         |
+|          CHUẨN GIAO TIẾP CHUNG: MODEL CONTEXT PROTOCOL (MCP)          |
+|        ======================================================         |
+|                                  ^                                    |
+|          +-----------------------+------------------------+           |
+|          |                       |                        |           |
+|    [ PostgreSQL ]           [ Stripe ]               [ Sentry ]       |
++-----------------------------------------------------------------------+
+
+```
+
+* **Lời dẫn (Speaker Notes):** Để giải quyết sự phân mảnh đó, **MCP (Model Context Protocol)** ra đời. Hãy hình dung nó giống hệt như chuẩn cổng **USB-C**: Thay vì mỗi thiết bị một đầu cắm, MCP đặt ra một ngôn ngữ giao tiếp chuẩn ở giữa. Nhờ đó, bất kỳ ứng dụng AI nào cũng có thể cắm vào bất kỳ công cụ nào mà không cần viết lại code tích hợp, biến bài toán $M \times N$ thành $M + N$.
+
+---
+
+### Slide 5: So sánh — Sự khác biệt giữa `HTTP/REST API` và `MCP` (Phần 1)
+
+* **Chữ trên Slide:**
+* **Khác biệt giữa HTTP API và MCP (Phần 1)**
+* *MCP không thay thế API — MCP là Smart Adapter bọc trước API*
+
+
+* **Khung Thiết Kế Hình Ảnh Trên Slide:**
+
+```text
++-----------------------------------------------------------------------+
+|  TIÊU CHÍ         HTTP / REST API TRUYỀN THỐNG     GIAO THỨC MCP      |
+|  -------------------------------------------------------------------  |
+|  1. Định dạng     Thiết kế cho Con người code.     Biên dịch sang     |
+|     phản hồi      (VD: K8s trả về 500 dòng JSON    "AI-Speak" tinh gọn|
+|                   -> Tràn Context, Hallucinate)    ("Pod Running, 2h")|
+|  -------------------------------------------------------------------  |
+|  2. Cơ chế        📜 Tĩnh (Thực đơn in sẵn)        🤵 Động (Phục vụ)  |
+|     khám phá      Phải đọc doc & hardcode từng     Tự động khám phá   |
+|     (Discovery)   endpoint vào mã nguồn.           lúc chạy (Runtime).|
++-----------------------------------------------------------------------+
+
+```
+
+* **Lời dẫn (Speaker Notes):** Đến đây chắc chắn các bạn sẽ hỏi: *"Chúng ta đã có HTTP/REST API hàng chục năm nay, tại sao lại cần MCP?"*. Đầu tiên cần khẳng định: **MCP không thay thế API gốc** mà đứng trước API làm bộ chuyển đổi thông minh (Smart Adapter). Sự khác biệt nằm ở chỗ:
+1. **Định dạng dữ liệu:** REST API trả về hàng trăm trường JSON cho con người parse, đẩy thẳng vào LLM rất dễ tràn bộ nhớ và gây ảo giác. MCP lọc gọn lại thành câu trả lời súc tích ("AI-speak").
+2. **Khám phá công cụ:** REST API giống thực đơn in sẵn phải hardcode vào code; còn MCP giống người phục vụ bàn, cho phép ứng dụng AI tự động hỏi xem có những công cụ nào ngay lúc khởi động (Dynamic Discovery).
+
+
+
+---
+
+### Slide 6: So sánh — Sự khác biệt giữa `HTTP/REST API` và `MCP` (Phần 2)
+
+* **Chữ trên Slide:**
+* **Khác biệt giữa HTTP API và MCP (Phần 2)**
+* *Cô lập khóa bảo mật & Phân tách rõ trách nhiệm lưu ngữ cảnh*
+
+
+* **Khung Thiết Kế Hình Ảnh Trên Slide:**
+
+```text
++-----------------------------------------------------------------------+
+|  TIÊU CHÍ         HTTP / REST API TRUYỀN THỐNG     GIAO THỨC MCP      |
+|  -------------------------------------------------------------------  |
+|  3. Bảo mật       🔓 Ứng dụng AI phải trực tiếp    🔒 Cô lập Secrets  |
+|     (Credentials) ôm toàn bộ API Keys / DB Pass    Khóa nằm kín ở phía|
+|                   của mọi dịch vụ tích hợp.        công cụ, AI ko thấy|
+|  -------------------------------------------------------------------  |
+|  4. Chuỗi ngữ     Dev phải tự viết code hứng biến  Agent Harness giữ  |
+|     cảnh đa bước  từ API 1 truyền sang API 2, 3.   lịch sử kết quả để |
+|                                                    LLM tự nối chuỗi.  |
++-----------------------------------------------------------------------+
+
+```
+
+* **Lời dẫn (Speaker Notes):** Hai sự khác biệt lớn tiếp theo:
+3. **Về bảo mật (Credential Isolation):** Khi gọi thẳng API, ứng dụng AI của bạn phải ôm toàn bộ API keys của hàng chục dịch vụ. Với MCP, toàn bộ mật khẩu DB và API keys được cô lập bên trong cổng MCP của công cụ đó, LLM không bao giờ nhìn thấy.
+4. **Về phối hợp đa bước:** Kết hợp với Agent Harness giữ lịch sử kết quả của các bước trước, LLM có thể tự động xâu chuỗi nhiều công cụ liên tiếp (ví dụ: vừa tra đơn hàng xong là gọi hoàn tiền luôn cho đơn đó) mà dev không phải viết code nối biến thủ công.
+
+---
+
+## PHẦN 2: KIẾN TRÚC 3 THÀNH PHẦN CỦA MCP & RANH GIỚI HỆ THỐNG (15:00 – 28:00)
+
+### Slide 7: Kiến trúc 3 Thành phần cốt lõi — `Host`, `Client` và `Server`
+
+* **Chữ trên Slide:**
+* **Kiến trúc 3 Thực thể của MCP (Spec 2026-07-28)**
+* *1 Host quản lý nhiều Clients • Mỗi Client kết nối 1-1 với 1 Server*
+
+
+* **Khung Thiết Kế Hình Ảnh Trên Slide:**
+
+```text
++-----------------------------------------------------------------------+
+|  1. MCP HOST (Ứng dụng AI trung tâm: VS Code / Claude / Backend App)  |
+|     - Quản lý giao diện, giữ lịch sử chat & điều phối gọi LLM         |
+|                                                                       |
+|     +-----------------------+           +-----------------------+     |
+|     |   2. MCP CLIENT #1    |           |   2. MCP CLIENT #2    |     |
+|     |   (Kết nối 1-1 riêng) |           |   (Kết nối 1-1 riêng) |     |
+|     +-----------+-----------+           +-----------+-----------+     |
++-----------------|-----------------------------------|-----------------+
+                  | (Đường truyền độc lập)            | (Đường truyền độc lập)
+                  v                                   v
+      +-----------------------+           +-----------------------+
+      |   3. MCP SERVER A     |           |   3. MCP SERVER B     |
+      |   (PostgreSQL MCP)    |           |   (Sentry MCP)        |
+      +-----------------------+           +-----------------------+
+
+```
+
+* **Lời dẫn (Speaker Notes):** Theo đặc tả kiến trúc chuẩn `2026-07-28`, hệ thống MCP gồm 3 thành phần rõ rệt:
+1. **MCP Host:** Là ứng dụng AI mà người dùng tương tác (như VS Code, Claude Desktop, hoặc Chatbot Backend). Host giữ lịch sử hội thoại và điều phối LLM.
+2. **MCP Client:** Là thành phần kết nối nằm bên trong Host. Khi Host kết nối tới nhiều MCP Server, nó sẽ khởi tạo từng đối tượng `MCP Client` riêng biệt. Mỗi Client duy trì kết nối 1-1 với đúng 1 Server để cô lập lỗi.
+3. **MCP Server:** Là chương trình độc lập cung cấp ngữ cảnh và công cụ (như Postgres Server, Sentry Server) cho Client.
+
+
+
+---
+
+### Slide 8: Hai mô hình triển khai — `Local MCP Server` vs. `Remote MCP Server`
+
+* **Chữ trên Slide:**
+* **MCP Server chạy ở đâu?**
+* *Chạy cục bộ trên máy (Local) hoặc chạy trên Cloud (Remote)*
+
+
+* **Khung Thiết Kế Hình Ảnh Trên Slide:**
+
+```text
++-----------------------------------------------------------------------+
+|  💻 LOCAL MCP SERVER                     ☁️ REMOTE MCP SERVER          |
+|  (Chạy cùng máy với Host)                (Chạy trên Cloud / Server)   |
+|                                                                       |
+|  [ MCP Client ]                          [ Client 1 ]  [ Client 2 ]   |
+|        |                                       \            /         |
+|        | (Phục vụ 1 Client)                     v          v          |
+|        v                                   [ Remote MCP Server ]      |
+|  [ Local Process / Docker ]                (Phục vụ nhiều Clients)    |
+|  Ví dụ: Filesystem, Local DB               Ví dụ: Sentry, GitHub Cloud|
++-----------------------------------------------------------------------+
+
+```
+
+* **Lời dẫn (Speaker Notes):** Thuật ngữ `MCP Server` dùng để chỉ chương trình cung cấp dữ liệu ngữ cảnh, bất kể nó chạy ở đâu:
+* **Local MCP Server:** Chạy ngay trên cùng máy tính với MCP Host (dưới dạng tiến trình con hoặc Docker container) và thường phục vụ đúng 1 MCP Client.
+* **Remote MCP Server:** Chạy trên nền tảng Cloud (như Sentry platform) và phục vụ đồng thời nhiều MCP Client từ xa.
+
+
+
+---
+
+### Slide 9: Sơ đồ Ranh giới — Giao thức MCP thực sự nằm ở đoạn nào?
+
+* **Chữ trên Slide:**
+* **Bản đồ Ranh giới: Đoạn nào là MCP? Đoạn nào KHÔNG phải?**
+* *MCP chỉ nằm trên đường dây giữa `MCP Client` và `MCP Server*`
+
+
+* **Khung Thiết Kế Hình Ảnh Trên Slide:**
+
+```text
++-----------------------------------------------------------------------+
+|  [ VÙNG 1: TRONG MCP HOST ] (Ngoài phạm vi MCP)                       |
+|    Bộ điều phối Host  <---(API riêng của hãng LLM)--->  Mô hình LLM   |
+|    [ MCP Client #1 ]               [ MCP Client #2 ]                  |
++-----------|-------------------------------|---------------------------+
+            |                               |
+============|===============================|============================
+  🔥 VÙNG 2: RANH GIỚI CỦA GIAO THỨC MCP (THE MCP WIRE) 🔥
+     Truyền gói tin chuẩn hóa giữa MCP Client <===> MCP Server
+============|===============================|============================
+            v                               v
++-----------|-------------------------------|---------------------------+
+|  [ Postgres MCP Server ]         [ Sentry MCP Server ]                |
+|           | (Driver SQL port 5432)        | (Sentry REST API gốc)     |
+|           v                               v                           |
+|    [( PostgreSQL DB )]             [( Sentry Cloud )]                 |
+|  [ VÙNG 3: HỆ THỐNG GỐC ] (Ngoài phạm vi MCP)                         |
++-----------------------------------------------------------------------+
+
+```
+
+* **Lời dẫn (Speaker Notes):** Khi ghép 3 thành phần `Host`, `Client`, `Server` vào bức tranh toàn cảnh kết nối tới PostgreSQL và Sentry, ta thấy ngay ranh giới chính xác của MCP:
+* **Vùng 1 (Giữa Host và LLM):** KHÔNG phải MCP. Host gọi Claude/GPT bằng API riêng của từng hãng.
+* **Vùng 3 (Giữa MCP Server và DB/Sentry):** KHÔNG phải MCP. Server vẫn gọi Postgres bằng giao thức SQL port 5432 và gọi Sentry bằng REST API gốc.
+* **Vùng 2 (Giữa `MCP Client` và `MCP Server`):** Đây chính là nơi giao thức MCP hoạt động!
+
+
+
+---
+
+## PHẦN 3: BÊN TRONG ĐƯỜNG DÂY MCP — 2 TẦNG GIAO THỨC & PRIMITIVES (28:00 – 40:00)
+
+### Slide 10: Ngôn ngữ giao tiếp — Tại sao chọn `JSON-RPC 2.0`?
+
+* **Chữ trên Slide:**
+* **Ngôn ngữ bên trong đường dây MCP: JSON-RPC 2.0**
+* *Đóng gói lời gọi hàm thành JSON • Độc lập với đường truyền*
+
+
+* **Khung Thiết Kế Hình Ảnh Trên Slide:**
+
+```text
++-----------------------------------------------------------------------+
+|   REST API (Phụ thuộc vào HTTP)       JSON-RPC 2.0 (Chuẩn của MCP)    |
+|                                                                       |
+|   GET /repos/org/api/issues/42        {                               |
+|   Host: api.github.com                  "jsonrpc": "2.0",             |
+|   Authorization: Bearer xxx             "id": 1,                      |
+|   ----------------------------          "method": "tools/call",       |
+|   ❌ Không chạy được qua ống            "params": {                   |
+|      stdin/stdout cục bộ                  "name": "get_issue",        |
+|   ❌ Chỉ gọi 1 chiều Client->Server       "arguments": {"id": 42}     |
+|                                         }                             |
+|                                       }                               |
+|                                       ✅ Chạy cả Local lẫn Internet   |
+|                                       ✅ Gọi 2 chiều Client <-> Server|
++-----------------------------------------------------------------------+
+
+```
+
+* **Lời dẫn (Speaker Notes):** Bên trong đường dây nối giữa `MCP Client` và `MCP Server`, chúng nói chuyện bằng ngôn ngữ **JSON-RPC 2.0**. Lý do không dùng REST là vì JSON-RPC gói toàn bộ tên hàm (`method`) và tham số (`params`) vào một chuỗi JSON duy nhất, giúp nó chạy được cả trên ống dẫn hệ điều hành cục bộ lẫn qua mạng HTTP, đồng thời hỗ trợ giao tiếp 2 chiều giữa Client và Server.
+
+---
+
+### Slide 11: Giải phẫu 2 Tầng Giao Thức (`Transport Layer` & `Data Layer`)
+
+* **Chữ trên Slide:**
+* **Cấu trúc 2 Tầng của MCP (Spec 2026-07-28)**
+* *Tầng ngoài là Phong bì vận chuyển • Tầng trong là Ruột thư JSON-RPC*
+
+
+* **Khung Thiết Kế Hình Ảnh Trên Slide:**
+
+```text
++-----------------------------------------------------------------------+
+|  📦 TẦNG NGOÀI: TRANSPORT LAYER (Đường truyền & Bảo mật kết nối)      |
+|     • Local Server : Ống STDIO (stdin/stdout) -> Độ trễ = 0, an toàn  |
+|     • Remote Server: Streamable HTTP (HTTP POST + SSE + OAuth)        |
+|                                                                       |
+|     +-----------------------------------------------------------+     |
+|     | 📄 TẦNG TRONG: DATA LAYER (Ruột thư JSON-RPC 2.0)         |     |
+|     |  • Thiết kế STATELESS: Mỗi gói tin tự mang trường `_meta` |     |
+|     |    chứa version "2026-07-28" & năng lực của Client        |     |
+|     |  • Hàm bắt buộc: "server/discover" (Hỏi năng lực & Cache) |     |
+|     +-----------------------------------------------------------+     |
++-----------------------------------------------------------------------+
+
+```
+
+* **Lời dẫn (Speaker Notes):** Giao thức MCP gồm 2 tầng bọc lấy nhau như một bức thư:
+* **Tầng ngoài (Transport Layer)** là chiếc phong bì vận chuyển: dùng ống **STDIO** (`stdin/stdout`) cho Local Server không tốn chi phí mạng, hoặc dùng **Streamable HTTP** (`HTTP POST` kèm `SSE` và `OAuth`) cho Remote Server.
+* **Tầng trong (Data Layer)** là ruột thư JSON-RPC 2.0. Theo chuẩn `2026-07-28`, tầng Data Layer này là **Stateless**: mỗi gói tin đều đính kèm trường `_meta` khai báo phiên bản và năng lực để Server xử lý độc lập từng yêu cầu.
+
+
+
+---
+
+### Slide 12: Bộ tứ Nguyên hàm (`Primitives`) — Client và Server trao đổi những gì?
+
+* **Chữ trên Slide:**
+* **4 Khả năng cốt lõi (Primitives) trong MCP**
+* *MCP không chỉ có Tools!*
+
+
+* **Khung Thiết Kế Hình Ảnh Trên Slide:**
+
+```text
++-----------------------------------------------------------------------+
+|       3 NGUYÊN HÀM TỪ MCP SERVER              1 NGUYÊN HÀM TỪ CLIENT  |
+|                                                                       |
+|  🛠️ TOOLS         📚 RESOURCES                🙋 ELICITATION          |
+|  (tools/call)     (resources/get)             (elicitation/create)    |
+|  Hàm hành động:   Dữ liệu ngữ cảnh:           Server chủ động bật     |
+|  Chạy SQL,        Đọc file code,              popup hỏi người dùng    |
+|  Tạo PR, Refund   Đọc DB Schema               xác nhận [Approve/Deny] |
+|                                                                       |
+|  📝 PROMPTS (prompts/get): Mẫu câu lệnh đóng gói sẵn (/slash-command) |
+|  -------------------------------------------------------------------  |
+|  ℹ️ Lưu ý Spec 2026-07-28: Sampling & Logging đã chính thức Deprecated|
++-----------------------------------------------------------------------+
+
+```
+
+* **Lời dẫn (Speaker Notes):** Bên trong tầng Data Layer, `MCP Server` và `MCP Client` trao đổi 4 loại nguyên hàm (**Primitives**):
+* Server cung cấp: **Tools** (hàm thực thi hành động), **Resources** (nguồn dữ liệu đọc thêm như file, DB schema), và **Prompts** (mẫu câu lệnh tái sử dụng).
+* Client cung cấp: **Elicitation** (cho phép Server yêu cầu thêm thông tin hoặc xin xác nhận từ người dùng). Hai tính năng cũ là `Sampling` và `Logging` đã bị deprecated từ bản `2026-07-28`.
+
+
+
+---
+
+## PHẦN 4: CASE STUDY THỰC TIỄN (GITHUB MCP) & CHIẾN LƯỢC PRODUCTION (40:00 – 60:00)
+
+### Slide 13: Case Study Thực Tế — Giải phẫu `GitHub MCP Server` trên máy Dev
+
+* **Chữ trên Slide:**
+* **Thực tế trên máy bạn: Giải phẫu GitHub MCP**
+* *Bạn KHÔNG cần code Host, Client hay Server — Chỉ cần viết file Config!*
+
+
+* **Khung Thiết Kế Hình Ảnh Trên Slide:**
+
+```text
++-----------------------------------------------------------------------+
+|  💻 TRÊN MÁY TÍNH CỦA LẬP TRÌNH VIÊN                                  |
+|  +---------------------------------+     +-------------------------+  |
+|  | 1. MCP HOST: Phần mềm VS Code   |     | 3. MCP SERVER:          |  |
+|  | (Microsoft đã code sẵn)         |     | github-mcp-server       |  |
+|  |                                 |     | (GitHub đã code sẵn)    |  |
+|  |  +---------------------------+  |     |                         |  |
+|  |  | 2. MCP CLIENT (Module ngầm|==|====>| 🛠️ get_issue            |  |
+|  |  +---------------------------+  |MCP  | 🛠️ create_pull_request  |  |
+|  +---------------------------------+     | 📚 repo://.../README.md |  |
+|                   ^                      +------------+------------+  |
+|                   |                                   | (HTTPS + PAT) |
+|        📄 Việc duy nhất bạn làm:                      v               |
+|           Khai báo `.vscode/mcp.json`        [ api.github.com ]       |
++-----------------------------------------------------------------------+
+
+```
+
+* **Lời dẫn (Speaker Notes):** Để thấy toàn bộ kiến trúc này hoạt động ngoài đời thực, hãy nhìn vào ví dụ kết nối **VS Code** với **GitHub MCP Server**:
+* **MCP Host** là VS Code.
+* **MCP Client** là module nằm ngầm bên trong VS Code.
+* **MCP Server** là bộ `github-mcp-server` do chính GitHub phát hành.
+* Với tư cách người dùng, bạn không cần code bất kỳ thành phần nào trên đây, chỉ cần khai báo file cấu hình `.vscode/mcp.json`.
+
+
+
+---
+
+### Slide 14: Soi kính lúp vào file `.vscode/mcp.json` của GitHub
+
+* **Chữ trên Slide:**
+* **Mổ xẻ `mcp.json`: Toàn bộ kiến trúc nằm trong 15 dòng cấu hình**
+
+
+* **Khung Thiết Kế Hình Ảnh Trên Slide:**
+
+```json
+{
+  "mcpServers": {
+    "github-local": {
+      "type": "stdio",                         // <-- 1. Tầng Transport: Ống STDIO
+      "command": "docker",
+      "args": [
+        "run", "-i", "--rm",
+        "-e", "GITHUB_PERSONAL_ACCESS_TOKEN",
+        "ghcr.io/github/github-mcp-server",
+        "--toolsets=issues,pull_requests"      // <-- 2. Chỉ bật nhóm Tool cần dùng
+      ],
+      "env": {
+        "GITHUB_PERSONAL_ACCESS_TOKEN": "ghp_..." // <-- 3. Giấu Token trong Server
+      }
+    },
+    "github-remote": {
+      "type": "http",                          // <-- 1. Tầng Transport: Remote HTTP
+      "url": "https://api.githubcopilot.com/mcp/",
+      "headers": { "X-MCP-Readonly": "true" }  // <-- 4. Khóa quyền Ghi (An toàn)
+    }
+  }
+}
+
+```
+
+* **Lời dẫn (Speaker Notes):** Trong file `mcp.json` này, mọi khái niệm lý thuyết đều hiện diện rõ ràng:
+1. `"type": "stdio"` khởi chạy container cục bộ giao tiếp qua ống STDIO; trong khi `"type": "http"` kết nối tới Remote Server của GitHub.
+2. `GITHUB_PERSONAL_ACCESS_TOKEN` được truyền riêng cho Server — mô hình LLM không bao giờ nhìn thấy chuỗi token này.
+3. `--toolsets` giúp giới hạn số lượng công cụ nạp vào LLM để tránh tràn Context Window, và `X-MCP-Readonly` khóa quyền chỉnh sửa để bảo vệ kho code.
+
+
+
+---
+
+### Slide 15: Luồng chạy 6 bước khi bạn gõ lệnh vào VS Code
+
+* **Chữ trên Slide:**
+* **Trace thực tế: *"Đọc Issue #42, tìm file lỗi và comment hướng sửa"***
+
+
+* **Khung Thiết Kế Hình Ảnh Trên Slide:**
+
+```text
++-----------------------------------------------------------------------+
+|  [Dev]         [VS Code (Host + Client)]     [LLM]    [GitHub Server] |
+|    |                      |                    |             |        |
+|    |                      |--1. tools/list------------------>|        |
+|    |--2. "Đọc Issue #42"->|                    |             |        |
+|    |                      |--3. Câu hỏi+Tools->|             |        |
+|    |                      |<-4. Intent: -------|             |        |
+|    |                      |     get_issue(42)  |             |        |
+|    |                      |--5. tools/call------------------>|        |
+|    |                      |<-"Lỗi ở file tax.py"-------------|        |
+|    |                      |--6. Host lưu lịch sử & gửi lại-->|        |
+|    |                      |    (LLM gọi tiếp: get_file -> comment)    |
++-----------------------------------------------------------------------+
+
+```
+
+* **Lời dẫn (Speaker Notes):** Khi bạn gõ câu lệnh vào khung chat VS Code:
+1. Lúc khởi động, `MCP Client` gọi `tools/list` lấy danh sách hàm từ `GitHub Server`.
+2. Bạn đặt câu hỏi $\rightarrow$ VS Code gửi câu hỏi kèm danh sách hàm lên LLM.
+3. LLM trả về **ý định (Intent)** muốn gọi `get_issue(42)`.
+4. VS Code gửi gói tin MCP `tools/call` xuống `GitHub Server` để lấy nội dung Issue #42 (*"Lỗi ở file `tax.py` dòng 80"*).
+5. **VS Code (Host)** lưu kết quả đó vào lịch sử hội thoại và gửi lại cho LLM. Nhờ thấy tên file `tax.py` trong lịch sử, LLM tự động gọi tiếp `get_file_contents("tax.py")` rồi gọi `add_issue_comment` để đăng lời giải lên GitHub.
+
+
+
+---
+
+### Slide 16: Chiến lược Production & Tổng kết 3 Cấp độ Áp dụng
+
+* **Chữ trên Slide:**
+* **Kiến trúc Production & 3 Cấp độ Áp dụng cho Developer**
+
+
+* **Khung Thiết Kế Hình Ảnh Trên Slide:**
+
+```text
++-----------------------------------------------------------------------+
+|  🏢 KIẾN TRÚC PRODUCTION DOANH NGHIỆP: INTERNAL AGGREGATOR SERVER     |
+|  Host ---> [ 1 Company MCP Gateway ] ---> (DB / K8s / ERP nội bộ)     |
+|            • Quản lý 1 lớp Auth & Audit Log tập trung                 |
+|            • Code cứng Guardrails (VD: Cấm restart Pod giờ hành chính)|
+|  -------------------------------------------------------------------  |
+|  🎯 3 CẤP ĐỘ ÁP DỤNG NGAY NGÀY MAI:                                  |
+|  1. Dùng IDE (VS Code/Claude) + Tool có sẵn -> Chỉ viết `mcp.json`    |
+|  2. Nối AI vào hệ thống ERP/DB riêng công ty-> Code `MCP Server`      |
+|  3. Tự làm sản phẩm Chatbot/Agent riêng     -> Nhúng `MCP Client SDK` |
++-----------------------------------------------------------------------+
+
+```
+
+* **Lời dẫn (Speaker Notes):** Khép lại buổi chia sẻ là 2 đúc kết thực tiễn:
+* **Ở quy mô Doanh nghiệp (Production):** Thay vì cài rời rạc nhiều server nhỏ lẻ, hãy gom các công cụ nội bộ vào **1 Internal Aggregator MCP Server**. Tại đây, bạn quản lý tập trung 1 lớp Auth và **code cứng các quy tắc an toàn (Guardrails)** ngay trong Server thay vì phó mặc cho câu lệnh Prompt.
+* **Ở góc độ từng Developer:** Tùy vào nhu cầu thuộc cấp độ 1, 2 hay 3 trên màn hình mà bạn biết chính xác khi nào chỉ cần cấu hình `mcp.json`, khi nào cần viết `MCP Server` và khi nào cần nhúng `MCP Client SDK`. Cảm ơn mọi người và xin mời các câu hỏi!
